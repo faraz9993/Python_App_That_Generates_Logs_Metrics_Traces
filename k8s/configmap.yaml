@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-observability-service-config
+data:
+  PORT: "8080"
+  LOG_LEVEL: "INFO"
+  ENVIRONMENT: "dev"
+  SERVICE_NAME: "my-observability-service"
+  OTEL_SERVICE_NAME: "my-observability-service"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://grafana-alloy:4317"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+  OTEL_ENABLED: "true"
+  ENABLE_TRAFFIC_GENERATOR: "true"
+  ERROR_RATE: "0.1"
+  LATENCY_RATE: "0.05"
+  TRAFFIC_RATE: "5"
+  CPU_SIMULATION_ENABLED: "true"
+  MEMORY_SIMULATION_ENABLED: "true"
+  DOWNSTREAM_SERVICE_URL: "http://downstream-service:8080"
+  NESTED_SPANS_ENABLED: "true"
+  MULTI_LOG_ENABLED: "true"
+  ERROR_SPANS_ENABLED: "true"
+  DB_SPANS_ENABLED: "false"
+

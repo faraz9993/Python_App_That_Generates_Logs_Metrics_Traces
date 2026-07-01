@@ -1,0 +1,2 @@
+"""Observability demo service."""
+
