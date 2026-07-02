@@ -2,7 +2,7 @@
 
 FastAPI microservice demonstrating structured JSON logs, Prometheus/OpenMetrics metrics,
 OpenTelemetry tracing, synthetic traffic generation, simulation endpoints, and downstream
-service calls.
+service calls along with exemplars feature.
 
 ## Run Locally
 
