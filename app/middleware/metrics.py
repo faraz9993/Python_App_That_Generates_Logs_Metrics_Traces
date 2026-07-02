@@ -5,8 +5,13 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.config import get_settings
-from app.observability.metrics import HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL
-from app.utils.helpers import current_trace_ids, route_template
+from app.observability.metrics import (
+    HTTP_REQUEST_DURATION_SECONDS,
+    HTTP_REQUESTS_TOTAL,
+    inc_counter,
+    observe_histogram,
+)
+from app.utils.helpers import route_template
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
@@ -29,15 +34,8 @@ class MetricsMiddleware(BaseHTTPMiddleware):
                 "status": str(status_code),
                 "service": settings.service_name,
             }
-            HTTP_REQUESTS_TOTAL.labels(**labels).inc()
-
-            trace_id, span_id = current_trace_ids()
-            exemplar = {"trace_id": trace_id, "span_id": span_id} if trace_id and span_id else None
-            try:
-                HTTP_REQUEST_DURATION_SECONDS.labels(**labels).observe(elapsed, exemplar=exemplar)
-            except TypeError:
-                HTTP_REQUEST_DURATION_SECONDS.labels(**labels).observe(elapsed)
+            inc_counter(HTTP_REQUESTS_TOTAL.labels(**labels))
+            observe_histogram(HTTP_REQUEST_DURATION_SECONDS.labels(**labels), elapsed)
 
             if response is not None:
                 response.headers["x-observed-service"] = settings.service_name
-

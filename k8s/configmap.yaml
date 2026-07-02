@@ -8,7 +8,7 @@ data:
   ENVIRONMENT: "dev"
   SERVICE_NAME: "my-observability-service"
   OTEL_SERVICE_NAME: "my-observability-service"
-  OTEL_EXPORTER_OTLP_ENDPOINT: "http://grafana-alloy:4317"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://grafana-alloy.monitoring.svc.cluster.local:4317"
   OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
   OTEL_ENABLED: "true"
   ENABLE_TRAFFIC_GENERATOR: "true"
@@ -22,4 +22,3 @@ data:
   MULTI_LOG_ENABLED: "true"
   ERROR_SPANS_ENABLED: "true"
   DB_SPANS_ENABLED: "false"
-

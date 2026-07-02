@@ -5,11 +5,10 @@ metadata:
   labels:
     app: my-observability-service
 spec:
-  type: ClusterIP
+  type: LoadBalancer
   selector:
     app: my-observability-service
   ports:
     - name: http
-      port: 8080
+      port: 80
       targetPort: http
-

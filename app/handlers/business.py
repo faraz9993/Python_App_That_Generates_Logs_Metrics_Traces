@@ -9,6 +9,7 @@ from app.observability.metrics import (
     CUSTOMERS_RETRIEVED_TOTAL,
     ORDERS_CREATED_TOTAL,
     PRODUCTS_RETRIEVED_TOTAL,
+    inc_counter,
 )
 from app.observability.tracing import get_tracer
 from app.services.store import store
@@ -22,7 +23,7 @@ logger = get_logger("business")
 @router.get("/customers", response_model=list[Customer])
 async def list_customers() -> list[Customer]:
     with tracer.start_as_current_span("customers.list"):
-        CUSTOMERS_RETRIEVED_TOTAL.labels(service=settings.service_name).inc()
+        inc_counter(CUSTOMERS_RETRIEVED_TOTAL.labels(service=settings.service_name))
         return store.list_customers()
 
 
@@ -30,7 +31,7 @@ async def list_customers() -> list[Customer]:
 async def get_customer(customer_id: int) -> Customer:
     with tracer.start_as_current_span("customers.get") as span:
         span.set_attribute("customer.id", customer_id)
-        CUSTOMERS_RETRIEVED_TOTAL.labels(service=settings.service_name).inc()
+        inc_counter(CUSTOMERS_RETRIEVED_TOTAL.labels(service=settings.service_name))
         return store.get_customer(customer_id)
 
 
@@ -60,7 +61,7 @@ async def delete_customer(customer_id: int) -> Response:
 @router.get("/products", response_model=list[Product])
 async def list_products() -> list[Product]:
     with tracer.start_as_current_span("products.list"):
-        PRODUCTS_RETRIEVED_TOTAL.labels(service=settings.service_name).inc()
+        inc_counter(PRODUCTS_RETRIEVED_TOTAL.labels(service=settings.service_name))
         return store.list_products()
 
 
@@ -68,7 +69,7 @@ async def list_products() -> list[Product]:
 async def get_product(product_id: int) -> Product:
     with tracer.start_as_current_span("products.get") as span:
         span.set_attribute("product.id", product_id)
-        PRODUCTS_RETRIEVED_TOTAL.labels(service=settings.service_name).inc()
+        inc_counter(PRODUCTS_RETRIEVED_TOTAL.labels(service=settings.service_name))
         return store.get_product(product_id)
 
 
@@ -118,7 +119,7 @@ async def create_order(payload: OrderCreate) -> Order:
         order = store.create_order(payload)
         span.set_attribute("order.id", order.id)
         span.set_attribute("order.total", order.total)
-        ORDERS_CREATED_TOTAL.labels(service=settings.service_name).inc()
+        inc_counter(ORDERS_CREATED_TOTAL.labels(service=settings.service_name))
         logger.info("order created", order_id=order.id, total=order.total)
         return order
 
@@ -136,4 +137,3 @@ async def delete_order(order_id: int) -> Response:
         span.set_attribute("order.id", order_id)
         store.delete_order(order_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-

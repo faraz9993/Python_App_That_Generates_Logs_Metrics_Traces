@@ -20,8 +20,8 @@ spec:
     spec:
       containers:
         - name: app
-          image: fansari9993/faraz_test_repo:pyapp
-          imagePullPolicy: IfNotPresent
+          image: fansari9993/faraz_test_repo:local
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
@@ -47,4 +47,3 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
-

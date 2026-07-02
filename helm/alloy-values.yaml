@@ -1,0 +1,196 @@
+fullnameOverride: grafana-alloy
+
+controller:
+  type: deployment
+  replicas: 1
+
+service:
+  enabled: true
+  type: ClusterIP
+
+alloy:
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+      appProtocol: grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+      appProtocol: http
+
+  configMap:
+    create: true
+    content: |-
+      logging {
+        level  = "info"
+        format = "logfmt"
+      }
+
+      discovery.kubernetes "app_pods" {
+        role = "pod"
+
+        namespaces {
+          names = ["default"]
+        }
+      }
+
+      discovery.relabel "my_observability_service_pods" {
+        targets = discovery.kubernetes.app_pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          regex         = "my-observability-service"
+          action        = "keep"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_phase"]
+          regex         = "Running"
+          action        = "keep"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          target_label  = "app"
+        }
+
+        rule {
+          target_label = "service_name"
+          replacement  = "my-observability-service"
+        }
+      }
+
+      discovery.relabel "my_observability_service_metrics" {
+        targets = discovery.relabel.my_observability_service_pods.output
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scrape"]
+          regex         = "true"
+          action        = "keep"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_ip"]
+          target_label  = "__address__"
+          replacement   = "$1:8080"
+        }
+
+        rule {
+          target_label = "__metrics_path__"
+          replacement  = "/metrics"
+        }
+
+        rule {
+          target_label = "job"
+          replacement  = "my-observability-service"
+        }
+      }
+
+      prometheus.scrape "my_observability_service" {
+        targets         = discovery.relabel.my_observability_service_metrics.output
+        scrape_interval = "15s"
+        forward_to      = [prometheus.remote_write.mimir.receiver]
+      }
+
+      prometheus.remote_write "mimir" {
+        endpoint {
+          url            = "http://lgtm-mimir-nginx.monitoring.svc.cluster.local/api/v1/push"
+          send_exemplars = true
+        }
+      }
+
+      loki.source.kubernetes "my_observability_service" {
+        targets    = discovery.relabel.my_observability_service_pods.output
+        forward_to = [loki.process.my_observability_service.receiver]
+      }
+
+      loki.process "my_observability_service" {
+        stage.json {
+          expressions = {
+            level        = "level",
+            trace_id     = "trace_id",
+            span_id      = "span_id",
+            service_name = "service_name",
+            environment  = "environment",
+          }
+        }
+
+        stage.labels {
+          values = {
+            level        = "",
+            service_name = "",
+            environment  = "",
+          }
+        }
+
+        forward_to = [loki.write.loki.receiver]
+      }
+
+      loki.write "loki" {
+        endpoint {
+          url = "http://lgtm-loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push"
+        }
+      }
+
+      otelcol.receiver.otlp "app" {
+        grpc {
+          endpoint = "0.0.0.0:4317"
+        }
+
+        http {
+          endpoint = "0.0.0.0:4318"
+        }
+
+        output {
+          traces = [otelcol.processor.k8sattributes.app.input]
+        }
+      }
+
+      otelcol.processor.k8sattributes "app" {
+        extract {
+          metadata = [
+            "k8s.namespace.name",
+            "k8s.pod.name",
+            "k8s.deployment.name",
+            "k8s.node.name",
+          ]
+        }
+
+        output {
+          traces = [otelcol.processor.batch.app.input]
+        }
+      }
+
+      otelcol.processor.batch "app" {
+        output {
+          traces = [otelcol.exporter.otlp.tempo.input]
+        }
+      }
+
+      otelcol.exporter.otlp "tempo" {
+        client {
+          endpoint = "lgtm-tempo-distributor.monitoring.svc.cluster.local:4317"
+
+          tls {
+            insecure = true
+          }
+        }
+      }

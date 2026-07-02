@@ -1,5 +1,7 @@
 from prometheus_client import Counter, Histogram
 
+from app.utils.helpers import current_trace_ids
+
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
     "Total HTTP requests.",
@@ -26,3 +28,25 @@ DOWNSTREAM_CALLS_TOTAL = Counter(
     ["service", "target", "status"],
 )
 
+
+def current_exemplar() -> dict[str, str] | None:
+    trace_id, span_id = current_trace_ids()
+    if not trace_id or not span_id:
+        return None
+    return {"trace_id": trace_id, "span_id": span_id}
+
+
+def inc_counter(counter: Counter, amount: float = 1.0) -> None:
+    exemplar = current_exemplar()
+    try:
+        counter.inc(amount, exemplar=exemplar)
+    except TypeError:
+        counter.inc(amount)
+
+
+def observe_histogram(histogram: Histogram, value: float) -> None:
+    exemplar = current_exemplar()
+    try:
+        histogram.observe(value, exemplar=exemplar)
+    except TypeError:
+        histogram.observe(value)
