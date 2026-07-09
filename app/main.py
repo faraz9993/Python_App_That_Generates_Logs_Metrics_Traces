@@ -13,6 +13,7 @@ from app.middleware.tracing import BusinessTracingMiddleware
 from app.observability.instrumentation import instrument_app
 from app.observability.logging import configure_logging, get_logger
 from app.observability.tracing import configure_tracing
+from app.services.database import Database
 from app.services.downstream_client import DownstreamClient
 from app.services.traffic_generator import TrafficGenerator
 
@@ -25,6 +26,9 @@ logger = get_logger("main")
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.downstream_client = DownstreamClient(settings)
+    app.state.db = Database(settings)
+    if settings.db_spans_enabled:
+        await app.state.db.connect()
     app.state.traffic_generator = TrafficGenerator(settings)
     if settings.enable_traffic_generator:
         app.state.traffic_generator.start()
@@ -36,6 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.enable_traffic_generator:
             await app.state.traffic_generator.stop()
             logger.info("traffic generator stopped")
+        await app.state.db.close()
         await app.state.downstream_client.close()
         logger.info("service stopped")
 

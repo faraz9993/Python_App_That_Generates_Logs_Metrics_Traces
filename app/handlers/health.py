@@ -11,5 +11,6 @@ async def health() -> dict:
 @router.get("/ready")
 async def ready(request: Request) -> dict:
     downstream = await request.app.state.downstream_client.health()
-    return {"status": "ready", "downstream": downstream}
+    db_available = request.app.state.db.available
+    return {"status": "ready", "downstream": downstream, "database": {"available": db_available}}
 

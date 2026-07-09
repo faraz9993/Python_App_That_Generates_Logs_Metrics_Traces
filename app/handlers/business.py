@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 
 from app.config import get_settings
 from app.models.customer import Customer, CustomerCreate
@@ -114,13 +114,20 @@ async def get_order(order_id: int) -> Order:
 
 
 @router.post("/orders", response_model=Order, status_code=status.HTTP_201_CREATED)
-async def create_order(payload: OrderCreate) -> Order:
+async def create_order(payload: OrderCreate, request: Request) -> Order:
     with tracer.start_as_current_span("orders.create") as span:
         order = store.create_order(payload)
         span.set_attribute("order.id", order.id)
         span.set_attribute("order.total", order.total)
         inc_counter(ORDERS_CREATED_TOTAL.labels(service=settings.service_name))
         logger.info("order created", order_id=order.id, total=order.total)
+
+        if settings.db_spans_enabled:
+            with tracer.start_as_current_span("orders.persist_db") as persist_span:
+                persisted = await request.app.state.db.insert_order(order)
+                persist_span.set_attribute("order.id", order.id)
+                persist_span.set_attribute("db.persisted", persisted)
+
         return order
 
 

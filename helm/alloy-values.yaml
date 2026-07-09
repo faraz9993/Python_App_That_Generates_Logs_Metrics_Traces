@@ -41,12 +41,6 @@ alloy:
         targets = discovery.kubernetes.app_pods.targets
 
         rule {
-          source_labels = ["__meta_kubernetes_pod_label_app"]
-          regex         = "my-observability-service"
-          action        = "keep"
-        }
-
-        rule {
           source_labels = ["__meta_kubernetes_pod_phase"]
           regex         = "Running"
           action        = "keep"
@@ -69,12 +63,7 @@ alloy:
 
         rule {
           source_labels = ["__meta_kubernetes_pod_label_app"]
-          target_label  = "app"
-        }
-
-        rule {
-          target_label = "service_name"
-          replacement  = "my-observability-service"
+          target_label  = "service_name"
         }
       }
 

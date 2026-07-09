@@ -4,7 +4,15 @@ FastAPI microservice demonstrating structured JSON logs, Prometheus/OpenMetrics 
 OpenTelemetry tracing, synthetic traffic generation, simulation endpoints, and downstream
 service calls along with exemplars feature.
 
-## Run Locally
+> In this document you can:
+1. [Run Application Locally](#run-application-locally)
+2. [Deploy Application on Docker](#deploy-application-on-docker)
+3. [Deploy Application on Kubernetes](#deploy-application-on-kubernetes)
+4. [Deployment of LGTM Stack on EKS](#deployment-of-lgtm-stack-on-eks)
+5. [Deployment of Exemplars](#deployment-of-exemplars)
+6. [For Troublshooting](#for-troublshooting)
+
+## Run Application Locally
 
 ```bash
 cd my-observability-service
@@ -39,18 +47,363 @@ curl -X POST http://localhost:8080/api/orders \
   -d '{"customer_id":1,"items":[{"product_id":1,"quantity":1}]}'
 ```
 
-## Grafana Cloud / Alloy
+## Deploy Application on Docker
 
-Set `OTEL_ENABLED=true` and point `OTEL_EXPORTER_OTLP_ENDPOINT` at your Grafana Alloy
-OTLP gRPC receiver. When Alloy is installed in the `monitoring` namespace, use
-`http://grafana-alloy.monitoring.svc.cluster.local:4317`. The service emits W3C trace
-context through OpenTelemetry FastAPI and HTTPX instrumentation.
+```bash
+docker build -t my-observability-service:latest .
+docker run --rm -p 8080:8080 --env-file .env.example my-observability-service:latest
+```
 
-Logs are JSON on stdout and include `timestamp`, `level`, `event`, `service_name`,
-`environment`, `trace_id`, `span_id`, request metadata, latency, and request ID.
+Access the application at:
 
-Metrics are exposed from `/metrics` in OpenMetrics format for Prometheus-compatible
-scrapers, including HTTP request counters/histograms and business counters.
+- `http://localhost:8080/`
+- `http://localhost:8080/docs`
+- `http://localhost:8080/health`
+- `http://localhost:8080/api/orders`
+- `http://localhost:8080/metrics`
+
+The root URL serves a lightweight dashboard for health, sample business data, and
+simulation actions. FastAPI's Swagger UI remains available at `/docs`.
+
+When exposed through the Kubernetes `LoadBalancer` service, access the application at:
+
+```text
+http://<load-balancer-hostname>/
+```
+
+## Deploy Application on Kubernetes
+
+### Prerequisites / Assumptions
+
+- AWS CLI configured with sufficient IAM permissions (EKS, EC2, IAM, Route53/Resolver)
+- `kubectl`, `helm`, `eksctl` installed
+- A VPC with at least 2 subnets across 2 AZs, public IPs enabled on nodes (or NAT configured)
+- Region used in original setup: `ap-south-1`
+
+---
+
+### Create / Size the EKS Cluster Node Group Correctly
+
+The LGTM stack + Prometheus stack deploys **~30+ pods**. `t3.medium` only supports **~17 pods/node**
+(ENI/IP limit, not CPU/memory). Undersizing causes `0/N nodes available: Too many pods` errors.
+
+**Recommended node group sizing:**
+- Instance type: `c6i.large` (or larger, e.g. `t3.large` for fewer total nodes)
+- Desired size: **3**
+- Minimum size: **2**
+- Maximum size: **3**
+---
+Once, EKS Cluster is created, run below three commands:
+
+```bash
+kubectl apply -f k8s/postgres-secret.yaml
+kubectl apply -f k8s/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-service.yaml
+kubectl rollout status deployment/postgres
+
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+kubectl rollout status deployment/my-observability-service
+```
+
+The application will be deployed in the default namespace.
+
+You can get the Loadbalancer url of the service using below command:
+```bash
+kubectl get svc | grep my-observability-service
+```
+
+You can use the below command to check whether your app is generating logs and metrics and has trace ids.
+```bash
+kubectl logs -l app=my-observability-service --tail=50 | grep -i database
+curl http://<LOAD_BALANCER_URL>/metrics | grep db_calls_total
+```
+
+## Deployment of LGTM Stack on EKS
+
+This runbook captures everything needed to deploy the LGTM stack (Loki, Grafana, Tempo, Mimir)
+on a **fresh** EKS cluster, including environment-specific fixes discovered during the first
+deployment. Follow these in order — skipping steps will reproduce the same failures.
+
+## Install EBS CSI Driver Add-on (Required for PVCs)
+
+EKS does **not** ship the EBS CSI driver by default. Without it, all PVCs (MinIO, Mimir
+ingester/compactor/store-gateway) stay `Pending` forever.
+
+### Associate IAM OIDC provider with the cluster
+```bash
+eksctl utils associate-iam-oidc-provider --cluster <CLUSTER_NAME> --approve
+```
+
+### Create IAM service account + role for the CSI driver
+> Use a **cluster-specific role name** to avoid collisions in shared AWS accounts
+> (a generic name like `AmazonEKS_EBS_CSI_DriverRole` may already exist, owned by a
+> different cluster's CloudFormation stack).
+
+```bash
+eksctl create iamserviceaccount \
+  --name ebs-csi-controller-sa \
+  --namespace kube-system \
+  --cluster <CLUSTER_NAME> \
+  --role-name <CLUSTER_NAME>_EBS_CSI_DriverRole \
+  --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+  --approve \
+  --override-existing-serviceaccounts
+```
+
+### Install the add-on with that role attached
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+aws eks create-addon \
+  --cluster-name <CLUSTER_NAME> \
+  --addon-name aws-ebs-csi-driver \
+  --service-account-role-arn arn:aws:iam::${ACCOUNT_ID}:role/<CLUSTER_NAME>_EBS_CSI_DriverRole \
+  --resolve-conflicts OVERWRITE
+```
+
+### Verify
+```bash
+kubectl get pods -n kube-system | grep ebs-csi
+```
+Expect `ebs-csi-controller-*` pods at `6/6 Running` and `ebs-csi-node-*` at `3/3 Running`.
+
+If controller pods crash with `no EC2 IMDS role found` or STS/DNS errors — see [Fix STS VPC Endpoint](#fix-sts-vpc-endpoint) 
+
+If all controller pods are `6/6 Running` and `3/3 Running` - jump directly to [Deploy the LGTM Stack](#deploy-the-lgtm-stack).
+
+---
+
+## Fix STS VPC Endpoint
+
+**Symptom:** EBS CSI controller (and anything else doing AWS API calls via IRSA) fails with:
+```
+no EC2 IMDS role found
+```
+or, after DNS partially resolves:
+```
+dial tcp <private-ip>:443: i/o timeout
+```
+
+**Root cause found in our environment:** This AWS account has a pre-existing STS Interface
+VPC Endpoint (`com.amazonaws.<region>.sts`) with **Private DNS enabled**, which silently
+overrides public DNS resolution for `sts.<region>.amazonaws.com` inside the VPC. But the
+endpoint had:
+1. **Zero subnets / zero ENIs** configured — so Private DNS had nothing to resolve to (empty/NODATA responses)
+2. Even after adding subnets, its **security group only allowed 443 from `10.0.0.0/16`**, not the VPC's actual CIDR (`172.31.0.0/16`) — so the connection still timed out
+
+**This is an account/VPC-level config issue, not something Helm or EKS sets up — check for
+it on every fresh cluster in this same AWS account/VPC.**
+
+### Check if an STS VPC endpoint exists and its current state
+```bash
+aws ec2 describe-vpc-endpoints \
+  --filters "Name=vpc-id,Values=<VPC_ID>" \
+  --query "VpcEndpoints[*].[VpcEndpointId,ServiceName,State,PrivateDnsEnabled]" \
+  --output table
+```
+Look for `com.amazonaws.<region>.sts`.
+
+### Check its subnets/ENIs
+```bash
+aws ec2 describe-vpc-endpoints \
+  --vpc-endpoint-ids <STS_ENDPOINT_ID> \
+  --query "VpcEndpoints[0].[SubnetIds,NetworkInterfaceIds]"
+```
+If both are empty `[]`, the endpoint has no network presence — fix below.
+
+### Add your node group's subnets to the endpoint
+Get your node group's subnets (EKS Console → Node group → Details → Subnets, or):
+```bash
+aws eks describe-nodegroup --cluster-name <CLUSTER_NAME> --nodegroup-name <NODEGROUP_NAME> \
+  --query "nodegroup.subnets"
+```
+Then:
+```bash
+aws ec2 modify-vpc-endpoint \
+  --vpc-endpoint-id <STS_ENDPOINT_ID> \
+  --add-subnet-ids <subnet-1> <subnet-2>
+```
+
+### Fix the endpoint's security group to allow 443 from your nodes
+Check current rules:
+```bash
+aws ec2 describe-security-groups --group-ids <ENDPOINT_SG_ID> --query "SecurityGroups[0].IpPermissions"
+```
+Get your EKS cluster security group (the one auto-named `eks-cluster-sg-<cluster>-...`):
+```bash
+aws ec2 describe-instances \
+  --filters "Name=private-dns-name,Values=<any-node-private-dns-name>" \
+  --query "Reservations[0].Instances[0].SecurityGroups"
+```
+Add the rule:
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id <ENDPOINT_SG_ID> \
+  --protocol tcp \
+  --port 443 \
+  --source-group <EKS_CLUSTER_SG_ID>
+```
+
+### Verify DNS resolves to a private IP from inside the cluster
+```bash
+kubectl run debug --image=busybox --restart=Never -- sleep 3600
+sleep 5
+kubectl exec -it debug -- nslookup sts.<region>.amazonaws.com
+kubectl delete pod debug
+```
+Expect a `172.31.x.x` (or your VPC CIDR) private IP, not empty and not a public IP.
+
+### Restart the EBS CSI controller to pick up working STS access
+```bash
+kubectl rollout restart deployment ebs-csi-controller -n kube-system
+kubectl get pods -n kube-system | grep ebs-csi
+```
+Expect `6/6 Running`.
+
+---
+
+## Deploy the LGTM Stack
+
+### Clone repo and add Helm repos
+```bash
+git clone git@github.com:daviaraujocc/lgtm-stack.git
+cd lgtm-stack
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+kubectl create ns monitoring
+```
+
+### Install Prometheus Operator (CRDs + metrics)
+```bash
+helm install prometheus-operator --version 66.3.1 -n monitoring \
+  prometheus-community/kube-prometheus-stack -f helm/values-prometheus.yaml
+```
+
+### Install LGTM stack
+```bash
+helm install lgtm --version 2.1.0 -n monitoring \
+  grafana/lgtm-distributed -f helm/values-lgtm.local.yaml
+```
+> LGTM will be deployed in a namespace named **monitoring**
+
+> If this is your first install attempt with the STS fix already in place, it should
+> complete without timing out (the `lgtm-minio-post-job` hook depends on MinIO's PVC
+> binding, which depends on the EBS CSI driver, which depends on STS access).
+---
+
+## Post-Install: Fix Tempo's Missing Bucket
+
+**Known issue with this chart:** Mimir's Helm release includes a `make-minio-buckets` Job that
+auto-creates Mimir's buckets (`mimir-tsdb`, `mimir-ruler`) — but there's **no equivalent job for
+Tempo's bucket** (`tempo`). Tempo pods will crash-loop with:
+```
+unexpected error from ListObjects on tempo: The specified bucket does not exist
+```
+
+Check if the pvc is in **Pending** state or **Bound**:
+```
+kubectl get pvc -n monitoring
+```
+
+If they are in **Pending** state, run the below command
+```
+kubectl patch storageclass gp2 -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+Now, check again:
+```
+kubectl get pvc -n monitoring
+```
+
+### Get MinIO credentials
+```bash
+kubectl get secret lgtm-minio -n monitoring -o jsonpath='{.data.rootUser}' | base64 -d; echo
+kubectl get secret lgtm-minio -n monitoring -o jsonpath='{.data.rootPassword}' | base64 -d; echo
+```
+
+### Create the `tempo` bucket manually
+```bash
+kubectl exec -it <lgtm-minio-pod-name> -n monitoring -- sh
+```
+Inside the pod:
+```bash
+export HOME=/tmp
+mc alias set local http://localhost:9000 <root-user> <root-password>
+mc mb local/tempo
+mc ls local
+exit
+```
+
+### Restart Tempo pods to pick up the new bucket
+```bash
+kubectl delete pod -n monitoring -l app.kubernetes.io/name=tempo
+```
+(Or delete each `lgtm-tempo-*` pod individually if the label selector doesn't match.)
+
+### Verify
+```bash
+kubectl get pods -n monitoring | grep tempo
+```
+All Tempo pods should reach `1/1 Running` within ~1-2 minutes.
+
+---
+
+### Install Alloy
+
+For the LGTM stack installed in the `monitoring` namespace, install Alloy with:
+
+```bash
+helm install grafana-alloy grafana/alloy -n monitoring -f helm/alloy-values.yaml
+```
+
+### Verify Everything Is Healthy
+
+```bash
+kubectl get pods -n monitoring
+kubectl get pvc -n monitoring
+```
+
+Expect all PVCs `Bound`, all pods `Running` (except the one-shot `*-make-minio-buckets-*` job,
+which should show `Completed`).
+
+---
+
+## Access Grafana
+
+### Method 1:
+```bash
+kubectl port-forward svc/lgtm-grafana -n monitoring 3000:80
+```
+Open: `http://localhost:3000`
+
+### Method 2:
+Get the **lgtm-grafana** service type LoadBalancer:
+```bash
+kubectl patch svc lgtm-grafana -n monitoring -p '{"spec": {"type": "LoadBalancer"}}'
+```
+
+Wait for 5 minutes for load balancer to get create then enter hit the below command to get the external IP:
+```
+kubectl get svc lgtm-grafana -n monitoring
+curl: http://<EXTERNAL_IP>
+```
+
+To get admin credentials:
+```bash
+kubectl get secret lgtm-grafana -n monitoring -o jsonpath='{.data.admin-user}' | base64 -d; echo
+kubectl get secret lgtm-grafana -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+In Grafana: **Explore** → confirm Mimir, Loki, and Tempo data sources all query successfully.
+
+---
+
+## Deployment of Exemplars
 
 ### Exemplars
 
@@ -100,15 +453,6 @@ mimir:
 
 The nested `mimir.mimir.structuredConfig` path is required by the LGTM Helm chart.
 
-In Grafana, configure the Mimir/Prometheus datasource exemplar link:
-
-```text
-Internal link: enabled
-Data source: Tempo
-URL Label: trace_id
-Label name: trace_id
-```
-
 Verify Alloy is forwarding exemplars:
 
 ```bash
@@ -120,23 +464,42 @@ Verify Mimir is storing exemplars:
 
 ```bash
 kubectl port-forward -n monitoring svc/lgtm-mimir-nginx 9009:80
+```
+```bash
 curl -G "http://localhost:9009/prometheus/api/v1/query_exemplars" \
   --data-urlencode 'query=http_request_duration_seconds_bucket' \
   --data-urlencode "start=$(date -u -d '15 minutes ago' +%s)" \
   --data-urlencode "end=$(date -u +%s)"
 ```
 
-In Grafana Explore, select the Mimir datasource, enable exemplars, and query:
+In Grafana, configure new Prometheus datasource for Mimir:
+
+```text
+Name: Mimir-2
+Prometheus server URL: http://lgtm-mimir-nginx/prometheus
+
+Exemplars:
+Internal link: enabled
+Data source: Tempo
+URL Label: trace_id
+Label name: trace_id
+```
+> **Save & Test** then click on **Explore View**.
+
+In Grafana Explore, select the **Mimir-2** datasource, then click on **code** and enter below mentioned promql query:
 
 ```promql
 http_request_duration_seconds_bucket{service="my-observability-service", endpoint="/api/orders", le="0.005"}
 ```
 
-For the local LGTM stack installed in the `monitoring` namespace, install Alloy with:
-
-```bash
-helm install grafana-alloy grafana/alloy -n monitoring -f helm/alloy-values.yaml
+Under **Options** sections:
 ```
+Legend: Auto
+Format: Time Series
+Type: Range
+Exemplers: Enable
+```
+click on **Run Query** then you will be able to see diamonds on X-axis click on it.
 
 The application exports OTLP traces to:
 
@@ -144,169 +507,7 @@ The application exports OTLP traces to:
 http://grafana-alloy.monitoring.svc.cluster.local:4317
 ```
 
-## Deploy LGTM Stack
-
-Clone the LGTM stack repository and add the Helm repositories:
-
-```bash
-git clone git@github.com:daviaraujocc/lgtm-stack.git
-cd lgtm-stack
-
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo add grafana https://grafana.github.io/helm-charts
-helm repo update
-```
-
-Create the monitoring namespace:
-
-```bash
-kubectl create ns monitoring
-```
-
-Install kube-prometheus-stack:
-
-```bash
-helm install prometheus-operator --version 66.3.1 -n monitoring \
-  prometheus-community/kube-prometheus-stack -f helm/values-prometheus.yaml
-```
-
-Before installing LGTM, make sure Mimir exemplar storage is enabled in
-`helm/values-lgtm.local.yaml`:
-
-```yaml
-mimir:
-  mimir:
-    structuredConfig:
-      limits:
-        max_global_exemplars_per_user: 100000
-```
-
-Install the LGTM stack:
-
-```bash
-helm install lgtm --version 2.1.0 -n monitoring \
-  grafana/lgtm-distributed -f helm/values-lgtm.local.yaml
-```
-
-Install Grafana Alloy from the application repository so it can collect this service's
-logs, metrics, and traces:
-
-```bash
-cd ../my-observability-service
-
-helm install grafana-alloy grafana/alloy -n monitoring \
-  -f helm/alloy-values.yaml
-```
-
-If the LGTM or Alloy values change later, use `helm upgrade`:
-
-```bash
-cd ../lgtm-stack
-helm upgrade lgtm --version 2.1.0 -n monitoring \
-  grafana/lgtm-distributed -f helm/values-lgtm.local.yaml
-
-cd ../my-observability-service
-helm upgrade grafana-alloy grafana/alloy -n monitoring \
-  -f helm/alloy-values.yaml
-```
-
-Verify the monitoring stack:
-
-```bash
-kubectl get all -n monitoring
-kubectl get svc -n monitoring
-```
-
-Access Grafana:
-
-```bash
-kubectl port-forward -n monitoring svc/lgtm-grafana 3000:80
-```
-
-Open:
-
-```text
-http://localhost:3000
-```
-
-## Docker
-
-```bash
-docker build -t my-observability-service:latest .
-docker run --rm -p 8080:8080 --env-file .env.example my-observability-service:latest
-```
-
-Access the application at:
-
-- `http://localhost:8080/`
-- `http://localhost:8080/docs`
-- `http://localhost:8080/health`
-- `http://localhost:8080/api/orders`
-- `http://localhost:8080/metrics`
-
-The root URL serves a lightweight dashboard for health, sample business data, and
-simulation actions. FastAPI's Swagger UI remains available at `/docs`.
-
-When exposed through the Kubernetes `LoadBalancer` service, access the application at:
-
-```text
-http://<load-balancer-hostname>/
-```
-
-## Kubernetes
-
-```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-```
-
-### Deploy On EKS
-
-Point `kubectl` at the EKS cluster:
-
-```bash
-aws eks update-kubeconfig --region ap-south-1 --name <eks-cluster-name>
-kubectl get nodes
-```
-
-Make sure `k8s/deployment.yaml` points to an image that EKS can pull, for example:
-
-```yaml
-image: fansari9993/faraz_test_repo:local
-```
-
-If you changed the application code, rebuild and push the image first:
-
-```bash
-docker login
-docker build -t fansari9993/faraz_test_repo:local .
-docker push fansari9993/faraz_test_repo:local
-```
-
-Deploy the application:
-
-```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-kubectl rollout status deployment/my-observability-service
-```
-
-Verify the pods and service:
-
-```bash
-kubectl get all
-kubectl get svc my-observability-service
-```
-
-If the service type is `LoadBalancer`, wait for `EXTERNAL-IP` / hostname, then access:
-
-```bash
-curl http://<load-balancer-hostname>/
-curl http://<load-balancer-hostname>/health
-curl http://<load-balancer-hostname>/api/orders
-```
+# For Troublshooting:
 
 ### Docker Hub Image Push
 
@@ -315,8 +516,8 @@ can start the pod.
 
 ```bash
 docker login
-docker build -t fansari9993/faraz_test_repo:local .
-docker push fansari9993/faraz_test_repo:local
+docker build -t fansari9993/faraz_test_repo:db-v1 .
+docker push fansari9993/faraz_test_repo:db-v1
 
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/deployment.yaml
@@ -370,3 +571,9 @@ kubectl rollout status deployment/my-observability-service
 
 The `ErrImagePull` / `ImagePullBackOff` status means the pod has not started yet because
 the node cannot pull the configured container image.
+
+### General Flow For Metrics:
+```
+Application Level Metrics > Grafana Alloy > Mimir
+Infrastructure/cluster Level Metrics > Prometheus > Mimir
+```

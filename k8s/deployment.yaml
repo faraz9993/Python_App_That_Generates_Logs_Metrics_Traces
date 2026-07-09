@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: fansari9993/faraz_test_repo:local
+          image: fansari9993/faraz_test_repo:db-v2
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -28,6 +28,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: my-observability-service-config
+            - secretRef:
+                name: postgres-credentials
           readinessProbe:
             httpGet:
               path: /ready

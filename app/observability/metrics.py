@@ -27,6 +27,11 @@ DOWNSTREAM_CALLS_TOTAL = Counter(
     "Total downstream service calls.",
     ["service", "target", "status"],
 )
+DB_CALLS_TOTAL = Counter(
+    "db_calls_total",
+    "Total database calls.",
+    ["service", "operation", "status"],
+)
 
 
 def current_exemplar() -> dict[str, str] | None:

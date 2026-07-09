@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     error_spans_enabled: bool = Field(default=True, alias="ERROR_SPANS_ENABLED")
     db_spans_enabled: bool = Field(default=False, alias="DB_SPANS_ENABLED")
 
+    db_host: str = Field(default="postgres", alias="DB_HOST")
+    db_port: int = Field(default=5432, alias="DB_PORT")
+    db_name: str = Field(default="orders", alias="DB_NAME")
+    db_user: str = Field(default="app", alias="DB_USER")
+    db_password: str = Field(default="app", alias="DB_PASSWORD")
+    db_pool_min_size: int = Field(default=1, alias="DB_POOL_MIN_SIZE")
+    db_pool_max_size: int = Field(default=5, alias="DB_POOL_MAX_SIZE")
+    db_connect_timeout_seconds: float = Field(default=5.0, alias="DB_CONNECT_TIMEOUT_SECONDS")
+
 
 @lru_cache
 def get_settings() -> Settings:
